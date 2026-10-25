@@ -15,6 +15,7 @@ from huggingface_hub import hf_hub_download
 
 from .modules_rgbd_encoder import DINOv2_RGBD_Encoder
 from .modules_decoder import MLP, ConvStack
+from .modules_refiner import AnchoredRefiner
 from ..utils.geo import depth_to_pointcloud, normalized_view_plane_uv
 
 
@@ -37,6 +38,8 @@ class MDMModel(nn.Module):
         remap_depth_in: Literal['linear', 'log'] = 'log',
         remap_depth_out: Literal['linear', 'exp'] = 'exp',
         num_tokens_range: List[int] = [1200, 3600],
+        depth_reinject: bool = False,
+        refiner: Dict[str, Any] = None,
         **deprecated_kwargs
     ):
         super(MDMModel, self).__init__()
@@ -47,14 +50,20 @@ class MDMModel(nn.Module):
         self.num_tokens_range = num_tokens_range
         self.remap_depth_in = remap_depth_in
         self.remap_depth_out = remap_depth_out
+        self.depth_reinject = depth_reinject
         
         self.encoder = DINOv2_RGBD_Encoder(**encoder)
         
+        if depth_reinject:
+            # levels 1-4 of the neck take [log raw depth, raw coverage] in addition to the UV map
+            neck = {**neck, 'dim_in': [neck['dim_in'][0]] + [d + 2 for d in neck['dim_in'][1:]]}
         self.neck = ConvStack(**neck)
         if depth_head is not None:
             self.depth_head = ConvStack(**depth_head) 
         if mask_head is not None:
             self.mask_head = ConvStack(**mask_head)
+        if refiner is not None:
+            self.refiner = AnchoredRefiner(**refiner)
 
     @property
     def device(self) -> torch.device:
@@ -85,9 +94,22 @@ class MDMModel(nn.Module):
         if model_kwargs is not None:
             model_config.update(model_kwargs)
         model = cls(**model_config)
-        model.load_state_dict(checkpoint['model'], strict=False)
+        state_dict = model.adapt_state_dict(checkpoint['model'])
+        model.load_state_dict(state_dict, strict=False)
         
         return model
+
+    def adapt_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Zero-pad neck input weights of a checkpoint without depth re-injection, so the extra inputs start unused."""
+        state_dict = dict(state_dict)
+        own = self.state_dict()
+        for key, value in state_dict.items():
+            if key.startswith('neck.input_blocks.') and key.endswith('.weight') and key in own \
+                    and value.shape != own[key].shape and value.shape[1] < own[key].shape[1]:
+                padded = torch.zeros_like(own[key])
+                padded[:, :value.shape[1]] = value
+                state_dict[key] = padded
+        return state_dict
             
     def init_weights(self):
         self.encoder.init_weights()
@@ -129,8 +151,18 @@ class MDMModel(nn.Module):
             else:
                 features[level] = torch.concat([features[level], uv], dim=1)
 
+        # Re-inject the measured depth at every decoder level
+        raw_mask, log_raw = self._log_depth(depth)
+        if self.depth_reinject:
+            for level in range(1, 5):
+                size = (base_h * 2 ** level, base_w * 2 ** level)
+                coverage = F.adaptive_avg_pool2d(raw_mask, size)
+                log_raw_level = F.adaptive_avg_pool2d(log_raw * raw_mask, size) / coverage.clamp_min(1e-6)
+                features[level] = torch.concat([features[level], log_raw_level.to(dtype), coverage.to(dtype)], dim=1)
+
         # Shared neck
         features = self.neck(features)
+        guide = features[-1]
 
         # Heads decoding
         depth_reg, normal, mask = (getattr(self, head)(features)[-1] if hasattr(self, head) else None for head in ['depth_head', 'normal_head', 'mask_head'])
@@ -158,14 +190,31 @@ class MDMModel(nn.Module):
         if metric_scale is not None:
             metric_scale = metric_scale.squeeze(1).exp()
 
+        # Refine with the measured depth at full resolution
+        depth_base, confidence = depth_reg, None
+        if depth_reg is not None and hasattr(self, 'refiner'):
+            log_pred = depth_reg.float().clamp_min(1e-3).log().unsqueeze(1)
+            log_depth, confidence = self.refiner(image, log_pred, log_raw, raw_mask, guide)
+            depth_reg, confidence = log_depth.exp().squeeze(1), confidence.squeeze(1)
+
         return_dict = {
             'depth_reg': depth_reg,
+            'depth_base': depth_base if hasattr(self, 'refiner') else None,
+            'confidence': confidence,
             'normal': normal,
             'mask': mask_prob,
         }
         return_dict = {k: v for k, v in return_dict.items() if v is not None}
 
         return return_dict
+
+    @staticmethod
+    def _log_depth(depth: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Valid mask (depth > 0.01 m, finite) and log depth (0 where invalid) of a (B, 1, H, W) depth map."""
+        depth = depth.float()
+        mask = (torch.isfinite(depth) & (depth > 0.01)).float()
+        log_depth = torch.where(mask > 0, depth.clamp_min(0.01).log(), torch.zeros_like(depth))
+        return mask, log_depth
 
     @torch.inference_mode()
     def infer(
@@ -177,6 +226,7 @@ class MDMModel(nn.Module):
         apply_mask: bool = True,
         use_fp16: bool = True,
         intrinsics: Optional[torch.Tensor] = None,
+        amp_dtype: torch.dtype = torch.bfloat16,
         **kwargs
     ) -> Dict[str, torch.Tensor]:
         if image.dim() == 3:
@@ -199,12 +249,12 @@ class MDMModel(nn.Module):
             num_tokens = int(min_tokens + (resolution_level / 9) * (max_tokens - min_tokens))
 
         # Forward pass
-        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=use_fp16 and self.dtype != torch.bfloat16):
+        with torch.autocast(device_type=self.device.type, dtype=amp_dtype, enabled=use_fp16 and self.dtype != amp_dtype):
             output = self.forward(image, num_tokens=num_tokens, depth=depth_in, **kwargs)
-        depth_reg, mask = (output.get(k, None) for k in ['depth_reg', 'mask'])
+        depth_reg, mask, confidence = (output.get(k, None) for k in ['depth_reg', 'mask', 'confidence'])
 
         # Always process the output in fp32 precision
-        depth_reg, mask = map(lambda x: x.float() if isinstance(x, torch.Tensor) else x, [depth_reg, mask])
+        depth_reg, mask, confidence = map(lambda x: x.float() if isinstance(x, torch.Tensor) else x, [depth_reg, mask, confidence])
         with torch.autocast(device_type=self.device.type, dtype=torch.float32):
             if mask is not None:
                 mask_binary = mask > 0.5
@@ -226,6 +276,7 @@ class MDMModel(nn.Module):
             'points': points,
             'depth': depth,
             'mask': mask_binary,
+            'confidence': confidence,
         }
         return_dict = {k: v for k, v in return_dict.items() if v is not None}
 
@@ -269,6 +320,7 @@ class MDMModel(nn.Module):
         apply_mask: bool = True,
         use_fp16: bool = True,
         intrinsics: Optional[torch.Tensor] = None,
+        amp_dtype: torch.dtype = torch.bfloat16,
         **kwargs
     ):
         if image.dim() == 3:
@@ -291,7 +343,7 @@ class MDMModel(nn.Module):
             num_tokens = int(min_tokens + (resolution_level / 9) * (max_tokens - min_tokens))
 
         # Forward pass
-        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=use_fp16 and self.dtype != torch.bfloat16):
+        with torch.autocast(device_type=self.device.type, dtype=amp_dtype, enabled=use_fp16 and self.dtype != amp_dtype):
             features, cls_token = self.forward_feat(image, num_tokens=num_tokens, depth=depth_in, **kwargs)
         
         return features, cls_token
